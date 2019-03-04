@@ -1,0 +1,68 @@
+#!groovy
+
+pipeline {
+
+    agent any
+    environment {
+        REPO = "art-hq.intranet.qualys.com:5001/sjms"
+        BUILD_NO = "${BUILD_ID}"
+        TEST_PATH = "sjmstest"
+    }
+    stages {
+        stage('sjms-build-and-test') {
+            steps {
+                sh 'env'
+                sh 'chmod 755 gradlew'
+                sh './gradlew clean build sonarqube --info'
+//                sh './gradlew clean build -x test'
+            }
+            post {
+                always {
+                    junit allowEmptyResults: true, healthScaleFactor: 0.0, keepLongStdio: true, testResults: '**/test-results/test/*.xml'
+                    jacoco()
+                }
+            }
+        }
+        stage('sjms-docker-integration') {
+            when {
+                expression {
+                    return (GIT_BRANCH == 'develop' || GIT_BRANCH.contains("SJMS-175"))
+                }
+            }
+            steps {
+                sh 'docker build -t "$REPO:$BUILD_NO" .'
+                sh 'docker push $REPO:$BUILD_NO'
+                sh 'echo pushed $REPO:$BUILD_NO to Artifactory'
+            }
+
+        }
+        stage('sjms-kubernetes-deploy') {
+            when {
+                expression {
+                    return (GIT_BRANCH == 'develop' || GIT_BRANCH.contains("SJMS-175"))
+                }
+            }
+            steps {
+//                sh 'helm del --purge sjms'
+//                sh '/usr/local/bin/helm install --name sjms --namespace sjms --debug --wait --set TAG=$BUILD_NO sjms-k8s '
+                sh '/usr/local/bin/helm upgrade sjms sjms-k8s'
+            }
+        }
+        stage('sjms-smoke-test') {
+            steps {
+                dir('sjmstest') {
+                    git branch: 'develop', credentialsId: 'sjms', url: 'https://stash.intranet.qualys.com/scm/plat/scan-job-management-test.git'
+                }
+                withEnv(["PYTHONPATH=${WORKSPACE}/$TEST_PATH"]) {
+                    echo "${PYTHONPATH}"
+                    sh '/opt/miniconda/bin/robot -d build/reports/robot $TEST_PATH/DataDrivenTemplates/Regression/DataDriven-JMI_CreateJobs.txt'
+                }
+            }
+            post {
+                always {
+                    step([$class: 'RobotPublisher', disableArchiveOutput: false, enableCache: true, logFileName: 'log.html', onlyCritical: true, otherFiles: '', outputFileName: 'output.xml', outputPath: 'build/reports/robot', passThreshold: 80.0, reportFileName: 'report.html', unstableThreshold: 20.0])
+                }
+            }
+        }
+    }
+}
